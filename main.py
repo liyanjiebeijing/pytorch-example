@@ -2,160 +2,159 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchvision
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader, random_split
-import matplotlib.pyplot as plt
+from torchvision import transforms
+from torch.utils.data import DataLoader
 from tqdm import tqdm
+from tensorboardX import SummaryWriter
+import os
 
-# 定义数据预处理
-train_transform = transforms.Compose([
-    transforms.RandomCrop(32, padding=4),
-    transforms.RandomHorizontalFlip(),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5071, 0.4867, 0.4408],
-                         std=[0.2675, 0.2565, 0.2761]),
-])
-
-val_transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5071, 0.4867, 0.4408],
-                         std=[0.2675, 0.2565, 0.2761]),
-])
-
-# 加载数据集
-cifar_data_dir="/root/data/cifar100/"
-train_dataset = datasets.CIFAR100(root=cifar_data_dir,
-                                  train=True,
-                                  download=True,
-                                  transform=train_transform)
-
-test_dataset = datasets.CIFAR100(root=cifar_data_dir,
-                                 train=False,
-                                 download=True,
-                                 transform=val_transform)
-
-# 划分训练集和验证集（80%训练，20%验证）
-train_size = int(0.8 * len(train_dataset))
-val_size = len(train_dataset) - train_size
-train_dataset, val_dataset = random_split(train_dataset, [train_size, val_size])
-
-# 创建数据加载器
-batch_size = 128
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-
-# 修改ResNet18模型适配CIFAR100
-def create_model():
-    model = torchvision.models.resnet18(pretrained=False)
-    # 修改第一个卷积层适配32x32输入
-    model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-    # 去掉原来的最大池化层（因为输入尺寸较小）
-    model.maxpool = nn.Identity()
-    # 修改最后的全连接层（CIFAR100有100个类别）
-    model.fc = nn.Linear(512, 100)
-    return model
-
-# 初始化模型、损失函数和优化器
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = create_model().to(device)
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
-scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[150, 225], gamma=0.1)
+# 数据集参数
+DATA_ROOT = '/root/data/cifar100/'
+BATCH_SIZE = 128
+NUM_WORKERS = 4
 
 # 训练参数
-epochs = 10  # 示例用10个epoch，实际训练可以增加到300
-best_val_acc = 0.0
-train_losses, val_losses = [], []
-train_accs, val_accs = [], []
+EPOCHS = 100
+LR = 0.1
+MOMENTUM = 0.9
+WEIGHT_DECAY = 5e-4
 
-# 训练循环
-for epoch in range(epochs):
-    model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
+# 定义ResNet18修改版（适配CIFAR-100的32x32输入）
+class CIFAR100ResNet18(nn.Module):
+    def __init__(self, num_classes=100):
+        super().__init__()
+        self.model = torchvision.models.resnet18(pretrained=False)
+        # 修改第一个卷积层和最大池化层
+        self.model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.model.maxpool = nn.Identity()  # 移除原始的最大池化层
+        # 修改最后的全连接层
+        self.model.fc = nn.Linear(self.model.fc.in_features, num_classes)
 
-    for inputs, labels in tqdm(train_loader):
-        inputs, labels = inputs.to(device), labels.to(device)
+    def forward(self, x):
+        return self.model(x)
 
-        optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
+# 数据预处理
+def get_datasets():
+    train_transform = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5071, 0.4867, 0.4408),
+                            (0.2675, 0.2565, 0.2761)),
+    ])
 
-        running_loss += loss.item()
-        _, predicted = outputs.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5071, 0.4867, 0.4408),
+                            (0.2675, 0.2565, 0.2761)),
+    ])
 
-    train_loss = running_loss / len(train_loader)
-    train_acc = 100 * correct / total
-    train_losses.append(train_loss)
-    train_accs.append(train_acc)
+    # 自动下载数据集
+    train_set = torchvision.datasets.CIFAR100(
+        root=DATA_ROOT, train=True, download=True, transform=train_transform)
+    test_set = torchvision.datasets.CIFAR100(
+        root=DATA_ROOT, train=False, download=True, transform=test_transform)
 
-    # 验证阶段
-    model.eval()
-    val_loss = 0.0
-    correct = 0
-    total = 0
+    return train_set, test_set
 
-    with torch.no_grad():
-        for inputs, labels in val_loader:
+def main():
+    # 设备配置
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # 创建日志目录
+    os.makedirs("logs", exist_ok=True)
+    writer = SummaryWriter("logs/cifar100_resnet18")
+
+    # 获取数据集
+    train_set, test_set = get_datasets()
+
+    # 创建数据加载器
+    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE,
+                             shuffle=True, num_workers=NUM_WORKERS)
+    test_loader = DataLoader(test_set, batch_size=BATCH_SIZE,
+                            shuffle=False, num_workers=NUM_WORKERS)
+
+    # 初始化模型
+    model = CIFAR100ResNet18().to(device)
+
+    # 定义损失函数和优化器
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.SGD(model.parameters(), lr=LR,
+                        momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.MultiStepLR(optimizer,
+                                             milestones=[60, 120], gamma=0.1)
+
+    best_acc = 0.0
+
+    # 训练循环
+    for epoch in range(EPOCHS):
+        # 训练阶段
+        model.train()
+        train_loss = 0.0
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
+
+        for inputs, labels in progress_bar:
             inputs, labels = inputs.to(device), labels.to(device)
+
+            optimizer.zero_grad()
             outputs = model(inputs)
             loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
 
-            val_loss += loss.item()
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
+            train_loss += loss.item() * inputs.size(0)
+            progress_bar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "lr": optimizer.param_groups[0]['lr']
+            })
 
-    val_loss = val_loss / len(val_loader)
-    val_acc = 100 * correct / total
-    val_losses.append(val_loss)
-    val_accs.append(val_acc)
+        # 验证阶段
+        model.eval()
+        test_loss = 0.0
+        correct = 0
+        total = 0
 
-    # 更新学习率
-    scheduler.step()
+        with torch.no_grad():
+            for inputs, labels in test_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
 
-    # 保存最佳模型
-    if val_acc > best_val_acc:
-        best_val_acc = val_acc
-        torch.save(model.state_dict(), 'best_model.pth')
+                test_loss += loss.item() * inputs.size(0)
+                _, predicted = outputs.max(1)
+                total += labels.size(0)
+                correct += predicted.eq(labels).sum().item()
 
-    print(f"Epoch [{epoch+1}/{epochs}] | "
-          f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}% | "
-          f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}%")
+        # 计算指标
+        train_loss = train_loss / len(train_set)
+        test_loss = test_loss / len(test_set)
+        test_acc = 100. * correct / total
 
-# 绘制训练曲线
-plt.figure(figsize=(12, 4))
-plt.subplot(1, 2, 1)
-plt.plot(train_losses, label='Train Loss')
-plt.plot(val_losses, label='Val Loss')
-plt.legend()
-plt.title('Loss Curve')
+        # 学习率更新
+        scheduler.step()
 
-plt.subplot(1, 2, 2)
-plt.plot(train_accs, label='Train Acc')
-plt.plot(val_accs, label='Val Acc')
-plt.legend()
-plt.title('Accuracy Curve')
-plt.show()
+        # 保存最佳模型
+        if test_acc > best_acc:
+            best_acc = test_acc
+            torch.save(model.state_dict(), "best_resnet18_cifar100.pth")
 
-# 在测试集上评估
-model.load_state_dict(torch.load('best_model.pth'))
-model.eval()
-correct = 0
-total = 0
+        # 记录TensorBoard指标
+        writer.add_scalars("Loss", {
+            "train": train_loss,
+            "test": test_loss
+        }, epoch)
+        writer.add_scalar("Accuracy/test", test_acc, epoch)
 
-with torch.no_grad():
-    for inputs, labels in test_loader:
-        inputs, labels = inputs.to(device), labels.to(device)
-        outputs = model(inputs)
-        _, predicted = outputs.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+        # 打印进度
+        tqdm.write(f"Epoch {epoch+1:03d}: "
+                  f"Train Loss: {train_loss:.4f} | "
+                  f"Test Loss: {test_loss:.4f} | "
+                  f"Accuracy: {test_acc:.2f}% | "
+                  f"Best Acc: {best_acc:.2f}%")
 
-print(f"Test Accuracy: {100 * correct / total:.2f}%")
+    writer.close()
+    print(f"Training complete! Best accuracy: {best_acc:.2f}%")
+
+if __name__ == "__main__":
+    main()
